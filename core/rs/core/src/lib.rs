@@ -17,6 +17,7 @@ mod c;
 mod changes_vtab;
 mod changes_vtab_read;
 mod changes_vtab_write;
+mod commit;
 mod compare_values;
 mod config;
 mod consts;
@@ -46,6 +47,8 @@ mod triggers;
 mod unpack_columns_vtab;
 mod util;
 
+use alloc::borrow::Cow;
+use alloc::format;
 use core::ffi::c_char;
 use core::mem;
 use core::ptr::null_mut;
@@ -57,17 +60,22 @@ use c::{crsql_freeExtData, crsql_newExtData};
 use config::{crsql_config_get, crsql_config_set};
 use core::ffi::{c_int, c_void, CStr};
 use create_crr::create_crr;
-use db_version::{crsql_fill_db_version_if_needed, crsql_next_db_version};
+use db_version::{
+    crsql_fill_db_version_if_needed, crsql_next_db_version, crsql_peek_next_db_version,
+};
 use is_crr::*;
 use local_writes::after_delete::x_crsql_after_delete;
 use local_writes::after_insert::x_crsql_after_insert;
 use local_writes::after_update::x_crsql_after_update;
+// use site_version::crsql_fill_site_version_if_needed;
 use sqlite::{Destructor, ResultCode};
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, Context, Value};
-use tableinfo::is_table_compatible;
+use tableinfo::{crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info};
 use teardown::*;
+use triggers::create_triggers;
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn crsql_as_table(
     ctx: *mut sqlite::context,
     argc: i32,
@@ -101,6 +109,7 @@ fn crsql_as_table_impl(db: *mut sqlite::sqlite3, table: &str) -> Result<ResultCo
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn sqlite3_crsqlcore_init(
     db: *mut sqlite::sqlite3,
     err_msg: *mut *mut c_char,
@@ -167,6 +176,11 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     let rc = crate::bootstrap::crsql_init_peer_tracking_table(db);
+    if rc != ResultCode::OK as c_int {
+        return null_mut();
+    }
+
+    let rc = crate::bootstrap::crsql_init_db_versions_table(db);
     if rc != ResultCode::OK as c_int {
         return null_mut();
     }
@@ -271,6 +285,40 @@ pub extern "C" fn sqlite3_crsqlcore_init(
 
     let rc = db
         .create_function_v2(
+            "crsql_peek_next_db_version",
+            0,
+            sqlite::UTF8 | sqlite::INNOCUOUS,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_peek_next_db_version),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    // let rc = db
+    //     .create_function_v2(
+    //         "crsql_site_version",
+    //         0,
+    //         sqlite::INNOCUOUS | sqlite::UTF8,
+    //         Some(ext_data as *mut c_void),
+    //         Some(x_crsql_site_version),
+    //         None,
+    //         None,
+    //         None,
+    //     )
+    //     .unwrap_or(ResultCode::ERROR);
+    // if rc != ResultCode::OK {
+    //     unsafe { crsql_freeExtData(ext_data) };
+    //     return null_mut();
+    // }
+
+    let rc = db
+        .create_function_v2(
             "crsql_sha",
             0,
             sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
@@ -285,23 +333,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
-
-    // let rc = db
-    //     .create_function_v2(
-    //         "crsql_version",
-    //         0,
-    //         sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
-    //         None,
-    //         Some(x_crsql_version),
-    //         None,
-    //         None,
-    //         None,
-    //     )
-    //     .unwrap_or(ResultCode::ERROR);
-    // if rc != ResultCode::OK {
-    //     unsafe { crsql_freeExtData(ext_data) };
-    //     return null_mut();
-    // }
 
     let rc = db
         .create_function_v2(
@@ -547,7 +578,7 @@ unsafe extern "C" fn x_crsql_as_crr(
 ) {
     if argc == 0 {
         ctx.result_error(
-            "Wrong number of args provided to crsql_as_crr. Provide the schema 
+            "Wrong number of args provided to crsql_as_crr. Provide the schema
           name and table name or just the table name.",
         );
         return;
@@ -560,6 +591,11 @@ unsafe extern "C" fn x_crsql_as_crr(
         ("main\0", args[0].text())
     };
 
+    // libc_print::libc_println!(
+    //     "crsql_as_crr, schema_name = {}, table_name = {}",
+    //     schema_name,
+    //     table_name
+    // );
     let db = ctx.db_handle();
     let mut err_msg = null_mut();
     let rc = db.exec_safe("SAVEPOINT as_crr");
@@ -567,6 +603,7 @@ unsafe extern "C" fn x_crsql_as_crr(
         ctx.result_error("failed to start as_crr savepoint");
         return;
     }
+
     let rc = crsql_create_crr(
         db,
         schema_name.as_ptr() as *const c_char,
@@ -607,7 +644,7 @@ unsafe extern "C" fn x_crsql_begin_alter(
 ) {
     if argc == 0 {
         ctx.result_error(
-            "Wrong number of args provided to crsql_begin_alter. Provide the 
+            "Wrong number of args provided to crsql_begin_alter. Provide the
           schema name and table name or just the table name.",
         );
         return;
@@ -643,41 +680,66 @@ unsafe extern "C" fn x_crsql_commit_alter(
 ) {
     if argc == 0 {
         ctx.result_error(
-            "Wrong number of args provided to crsql_commit_alter. Provide the 
+            "Wrong number of args provided to crsql_commit_alter. Provide the
           schema name and table name or just the table name.",
         );
         return;
     }
 
     let args = sqlite::args!(argc, argv);
-    let (schema_name, table_name) = if argc == 2 {
+    let (schema_name, table_name) = if argc >= 2 {
         (args[0].text(), args[1].text())
     } else {
         ("main", args[0].text())
     };
 
+    //libc_print::libc_println!("x_crsql_commit_alter");
+
+    let non_destructive = if argc >= 3 { args[2].int() == 1 } else { false };
+
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let mut err_msg = null_mut();
     let db = ctx.db_handle();
-    let rc = crsql_compact_post_alter(
-        db,
-        table_name.as_ptr() as *const c_char,
-        ext_data,
-        &mut err_msg as *mut _,
-    );
 
-    let rc = if rc == ResultCode::OK as c_int {
-        crsql_create_crr(
-            db,
-            schema_name.as_ptr() as *const c_char,
-            table_name.as_ptr() as *const c_char,
-            1,
-            0,
-            &mut err_msg as *mut _,
-        )
+    let rc = if non_destructive {
+        match pull_table_info(db, table_name, &mut err_msg as *mut _) {
+            Ok(table_info) => {
+                match create_triggers(db, &table_info, &mut err_msg) {
+                    Ok(ResultCode::OK) => {
+                        // need to ensure the right table infos in ext data
+                        crsql_ensure_table_infos_are_up_to_date(
+                            db,
+                            ext_data,
+                            &mut err_msg as *mut _,
+                        )
+                    }
+                    Ok(rc) | Err(rc) => rc as c_int,
+                }
+            }
+            Err(rc) => rc as c_int,
+        }
     } else {
-        rc
+        let rc = crsql_compact_post_alter(
+            db,
+            table_name.as_ptr() as *const c_char,
+            ext_data,
+            &mut err_msg as *mut _,
+        );
+
+        if rc == ResultCode::OK as c_int {
+            crsql_create_crr(
+                db,
+                schema_name.as_ptr() as *const c_char,
+                table_name.as_ptr() as *const c_char,
+                1,
+                0,
+                &mut err_msg as *mut _,
+            )
+        } else {
+            rc
+        }
     };
+
     let rc = if rc == ResultCode::OK as c_int {
         db.exec_safe("RELEASE alter_crr")
             .unwrap_or(ResultCode::ERROR) as c_int
@@ -686,7 +748,15 @@ unsafe extern "C" fn x_crsql_commit_alter(
     };
     if rc != ResultCode::OK as c_int {
         // TODO: use err_msg
-        ctx.result_error("failed compacting tables post alteration");
+        let error_str = if !err_msg.is_null() {
+            unsafe { CStr::from_ptr(err_msg).to_string_lossy() }
+        } else {
+            Cow::Borrowed("Hello World")
+        };
+        ctx.result_error(&format!(
+            "failed compacting tables post alteration: {}",
+            error_str
+        ));
         let _ = db.exec_safe("ROLLBACK");
         return;
     }
@@ -758,7 +828,7 @@ unsafe extern "C" fn x_crsql_next_db_version(
         0
     };
 
-    let ret = crsql_next_db_version(db, ext_data, provided_version, &mut err_msg as *mut _);
+    let ret = crsql_next_db_version(db, ext_data, &mut err_msg as *mut _);
     if ret < 0 {
         // TODO: use err_msg!
         ctx.result_error("Unable to determine the next db version");
@@ -767,6 +837,59 @@ unsafe extern "C" fn x_crsql_next_db_version(
 
     ctx.result_int64(ret);
 }
+
+/**
+ * Return the next version of the database for use in inserts/updates/deletes
+ * without updating the the database or value in ext_data.
+ *
+ * `select crsql_peek_next_db_version()`
+ */
+unsafe extern "C" fn x_crsql_peek_next_db_version(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let db = ctx.db_handle();
+    let mut err_msg = null_mut();
+
+    let provided_version = if argc == 1 {
+        sqlite::args!(argc, argv)[0].int64()
+    } else {
+        0
+    };
+
+    let ret = crsql_peek_next_db_version(db, ext_data, &mut err_msg as *mut _);
+    if ret < 0 {
+        // TODO: use err_msg!
+        ctx.result_error("Unable to determine the next db version");
+        return;
+    }
+
+    ctx.result_int64(ret);
+}
+
+/**
+ * Return the current version of the site.
+ *
+ * `select crsql_site_version()`
+ */
+// unsafe extern "C" fn x_crsql_site_version(
+//     ctx: *mut sqlite::context,
+//     _argc: i32,
+//     _argv: *mut *mut sqlite::value,
+// ) {
+//     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+//     let db = ctx.db_handle();
+//     let mut err_msg = null_mut();
+//     let rc = crsql_fill_site_version_if_needed(db, ext_data, &mut err_msg as *mut _);
+//     if rc != ResultCode::OK as c_int {
+//         // TODO: pass err_msg!
+//         ctx.result_error("failed to fill db version");
+//         return;
+//     }
+//     sqlite::result_int64(ctx, (*ext_data).siteVersion);
+// }
 
 /**
  * The sha of the commit that this version of crsqlite was built from.
@@ -815,6 +938,7 @@ unsafe extern "C" fn x_crsql_sync_bit(
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn crsql_is_crr(db: *mut sqlite::sqlite3, table: *const c_char) -> c_int {
     if let Ok(table) = unsafe { CStr::from_ptr(table).to_str() } {
         match is_crr(db, table) {
@@ -833,6 +957,7 @@ pub extern "C" fn crsql_is_crr(db: *mut sqlite::sqlite3, table: *const c_char) -
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn crsql_is_table_compatible(
     db: *mut sqlite::sqlite3,
     table: *const c_char,
@@ -848,6 +973,7 @@ pub extern "C" fn crsql_is_table_compatible(
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn crsql_create_crr(
     db: *mut sqlite::sqlite3,
     schema: *const c_char,
@@ -859,11 +985,11 @@ pub extern "C" fn crsql_create_crr(
     let schema = unsafe { CStr::from_ptr(schema).to_str() };
     let table = unsafe { CStr::from_ptr(table).to_str() };
 
-    return match (table, schema) {
+    match (table, schema) {
         (Ok(table), Ok(schema)) => {
             create_crr(db, schema, table, is_commit_alter != 0, no_tx != 0, err)
                 .unwrap_or_else(|err| err) as c_int
         }
         _ => ResultCode::NOMEM as c_int,
-    };
+    }
 }

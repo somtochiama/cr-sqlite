@@ -9,7 +9,7 @@ use sqlite::ResultCode;
 use sqlite_nostd as sqlite;
 
 fn crsql_changes_query_for_table(table_info: &TableInfo) -> Result<String, ResultCode> {
-    if table_info.pks.len() == 0 {
+    if table_info.pks.is_empty() {
         // no primary keys? We can't get changes for a table w/o primary keys...
         // this should be an impossible case.
         return Err(ResultCode::ABORT);
@@ -53,15 +53,15 @@ pub fn changes_union_query(
     let mut sub_queries = vec![];
 
     for table_info in table_infos {
-        let query_part = crsql_changes_query_for_table(&table_info)?;
+        let query_part = crsql_changes_query_for_table(table_info)?;
         sub_queries.push(query_part);
     }
 
     // Manually null-terminate the string so we don't have to copy it to create a CString.
     // We can just extract the raw bytes of the Rust string.
-    return Ok(format!(
+    Ok(format!(
       "SELECT tbl, pks, cid, col_vrsn, db_vrsn, site_id, key, seq, cl FROM ({unions}) {idx_str}\0",
       unions = sub_queries.join(" UNION ALL "),
       idx_str = idx_str,
-    ));
+    ))
 }

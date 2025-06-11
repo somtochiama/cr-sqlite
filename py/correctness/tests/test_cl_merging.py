@@ -19,9 +19,13 @@ import uuid
 #   - prop test with many tables
 #   - prop test with out-of-order sync
 
+count = 0
 
-def make_simple_schema():
-    c = connect(":memory:")
+def make_simple_schema(count=-1):
+    if count == -1:
+        c = connect(":memory:")
+    else:
+        c = connect("test" + str(count) + ".db")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
@@ -161,7 +165,7 @@ def test_larger_cl_delete_deletes_all():
             ('foo', b'\x01\t\x01', '-1', None, 2, 1, c1_site_id, 2, 1)])
     # c2 merged in the delete thus bumping causal length to 2 and bumping db version since there was a change.
     assert (c2_changes == [
-            ('foo', b'\x01\t\x01', '-1', None, 2, 2, c1_site_id, 2, 1)])
+            ('foo', b'\x01\t\x01', '-1', None, 2, 1, c1_site_id, 2, 1)])
     close(c1)
     close(c2)
 
@@ -393,11 +397,12 @@ def test_resurrection_of_live_thing_via_sentinel():
 
     changes = c2.execute("SELECT * FROM crsql_changes").fetchall()
 
-    # 'b' should be zeroed column version but latest db version.
+    # 'b' should be zeroed column version even though we keep the same db version.
+    # The sentinel row will also zero the column on another node when it receives it.
     c2_site_id = get_site_id(c2)
     c1_site_id = get_site_id(c1)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 1, 0, 2, c2_site_id, 3, 0),
-                        ('foo', b'\x01\t\x01', '-1', None, 3, 2, c1_site_id, 3, 2)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 1, 0, 1, c2_site_id, 3, 0),
+                        ('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 2)])
     # now lets finish getting changes from the other node
     changes = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
@@ -405,8 +410,9 @@ def test_resurrection_of_live_thing_via_sentinel():
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
     c2.commit()
 
+
     changes = c2.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (changes == [('foo', b'\x01\t\x01', '-1', None, 3, 2, c1_site_id, 3, 2),
+    assert (changes == [('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 2),
                         # col version bump to 1 since the other guy won on col version.
                         # db version bumped as well since the col version changed.
                         # holding the db version stable would prevent nodes that proxy other nodes
@@ -417,9 +423,157 @@ def test_resurrection_of_live_thing_via_sentinel():
                         # Then B receives changes from A which move B's clock forward w/o changing B's value
                         # C then merges to B and loses there
                         # If B db version didn't change then C would never get the changes that B is proxying from A
-                        ('foo', b'\x01\t\x01', 'b', 1, 1, 3, c1_site_id, 3, 3)])
+                        ('foo', b'\x01\t\x01', 'b', 1, 1, 1, c1_site_id, 3, 3)])
     close(c1)
     close(c2)
+
+def test_resurrection_of_live_thing_via_sentinel_multiple():
+    # col clocks get zeroed
+    c1 = make_simple_schema()
+    c2 = make_simple_schema()
+    c3 = make_simple_schema()
+
+    c2_site_id = get_site_id(c2)
+    c1_site_id = get_site_id(c1)
+    c3_site_id = get_site_id(c3)
+
+    c1.execute("INSERT INTO foo VALUES (1, 1)")
+    c1.execute("DELETE FROM foo")
+    c1.execute("INSERT INTO foo VALUES (1, 1)")
+    c1.commit()
+
+    c2.execute("INSERT INTO foo VALUES (1, 1)")
+    c2.commit()
+
+    c3.execute("INSERT INTO foo VALUES (1, 1)")
+    c3.execute("UPDATE foo SET b = 2 WHERE a = 1")
+    c3.commit()
+
+    c3_changes = c3.execute(
+        "SELECT * FROM crsql_changes").fetchone()
+    c2.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", c3_changes)
+    c2.commit()
+
+    # 'b' should be set to 2 since with c3's db_version c3 has a higher col_version.
+    changes2 = c2.execute("SELECT * FROM crsql_changes").fetchall()
+    assert (changes2 == [('foo', b'\x01\t\x01', 'b', 2, 2, 1, c3_site_id, 1, 1)])
+
+
+    # a resurrection of an already live row
+    # only merge over the sentinal colun to c2
+    sentinel_resurrect = c1.execute(
+        "SELECT * FROM crsql_changes WHERE cid = '-1'").fetchone()
+    c2.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
+    c2.commit()
+
+    c3.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
+    c3.commit()
+
+    changes2 = c2.execute("SELECT * FROM crsql_changes").fetchall()
+    changes3 = c3.execute("SELECT * FROM crsql_changes").fetchall()
+
+    # 'b' should be zeroed column version but same db version.
+    assert (changes2 == [('foo', b'\x01\t\x01', 'b', 2, 0, 1, c3_site_id, 3, 1),
+        ('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 2)])
+
+    assert (changes2 == changes3)
+
+    # now lets finish getting changes from the other node
+    changes = c1.execute(
+        "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c2.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
+    c2.commit()
+
+    c3.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
+    c3.commit()
+
+    changes2 = c2.execute("SELECT * FROM crsql_changes").fetchall()
+    changes3 = c3.execute("SELECT * FROM crsql_changes").fetchall()
+
+    assert (changes2 == [('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 2),
+                        ('foo', b'\x01\t\x01', 'b', 1, 1, 1, c1_site_id, 3, 3)])
+
+    assert (changes2 == changes3)
+    close(c1)
+    close(c2)
+
+
+def test_resurrection_of_live_thing_via_sentinel_out_of_order():
+    # col clocks get zeroed
+    c1 = make_simple_schema()
+    c2 = make_simple_schema()
+    c3 = make_simple_schema()
+
+    c2_site_id = get_site_id(c2)
+    c1_site_id = get_site_id(c1)
+    c3_site_id = get_site_id(c3)
+
+    c1.execute("INSERT INTO foo VALUES (1, 1)")
+    c1.execute("DELETE FROM foo")
+    c1.execute("INSERT INTO foo VALUES (1, 1)")
+    c1.commit()
+
+    c2.execute("INSERT INTO foo VALUES (1, 1)")
+    c2.commit()
+
+    # a resurrection of an already live row
+    # only merge over the sentinal colun to c2
+    sentinel_resurrect = c1.execute(
+        "SELECT * FROM crsql_changes WHERE cid = '-1'").fetchone()
+    c2.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
+    c2.commit()
+
+    c3.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
+    c3.commit()
+
+    changes2 = c2.execute("SELECT * FROM crsql_changes").fetchall()
+    changes3 = c3.execute("SELECT * FROM crsql_changes").fetchall()
+
+    # 'b' should be zeroed column version but same db version.
+    assert (changes2 == [('foo', b'\x01\t\x01', 'b', 1, 0, 1, c2_site_id, 3, 0),
+        ('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 2)])
+
+    # actor c3 will only have the sentinel row
+    assert (changes3 == [('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 2)])
+
+    changes_c2 = c2.execute(
+        "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c3.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", changes_c2)
+    c3.commit()
+
+    # syncing with c2 won't change anything since c3 already has the sentinel row
+    changes3 = c3.execute("SELECT * FROM crsql_changes").fetchall()
+    assert (changes3 == changes2)
+
+    # now lets finish getting changes from the other node
+    changes = c1.execute(
+        "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c2.execute(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
+    c2.commit()
+
+    c3.execute("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
+    c3.commit()
+
+    changes2 = c2.execute("SELECT * FROM crsql_changes").fetchall()
+    changes3 = c3.execute("SELECT * FROM crsql_changes").fetchall()
+
+    assert (changes2 == [('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 2),
+                        ('foo', b'\x01\t\x01', 'b', 1, 1, 1, c1_site_id, 3, 3)])
+
+    assert (changes2 == changes3)
+    close(c1)
+    close(c2)
+    close(c3)
+
 
 
 def test_resurrection_of_live_thing_via_non_sentinel():
@@ -445,8 +599,8 @@ def test_resurrection_of_live_thing_via_non_sentinel():
     # db version pushed
     # col version is at 1 given we rolled the causal length forward for the resurrection
     c1_site_id = get_site_id(c1)
-    assert (changes == [('foo', b'\x01\t\x01', '-1', None, 3, 2, c1_site_id, 3, 3),
-                        ('foo', b'\x01\t\x01', 'b', 1, 1, 2, c1_site_id, 3, 3)])
+    assert (changes == [('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 3),
+                        ('foo', b'\x01\t\x01', 'b', 1, 1, 1, c1_site_id, 3, 3)])
 
     # sync all other entries should be a no-op
     sync_left_to_right(c1, c2, 0)
@@ -481,7 +635,7 @@ def test_resurrection_of_dead_thing_via_sentinel():
     # cl = 3 given resurrected from dead (2)
     # db_version = 2 given it was a change
     assert (changes == [('foo', b'\x01\t\x01',
-            '-1', None, 3, 2, c1_site_id, 3, 2)])
+            '-1', None, 3, 1, c1_site_id, 3, 2)])
     close(c1)
     close(c2)
 
@@ -511,8 +665,8 @@ def test_resurrection_of_dead_thing_via_non_sentinel():
     # db_version = 2 given it was a change
     # col version rolled back given cl moved forward
     c1_site_id = get_site_id(c1)
-    assert (changes == [('foo', b'\x01\t\x01', '-1', None, 3, 2, c1_site_id, 3, 3),
-                        ('foo', b'\x01\t\x01', 'b', 1, 1, 2, c1_site_id, 3, 3)])
+    assert (changes == [('foo', b'\x01\t\x01', '-1', None, 3, 1, c1_site_id, 3, 3),
+                        ('foo', b'\x01\t\x01', 'b', 1, 1, 1, c1_site_id, 3, 3)])
     close(c1)
     close(c2)
 
